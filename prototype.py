@@ -98,17 +98,9 @@ class UsageRow(Gtk.Box):
         self.append(self._reset_label)
 
     def update(self, metric: api.Metric) -> None:
+        # Only called for available metrics; null ones are hidden by the caller.
         for cls in ("error", "warning"):
             self._bar.remove_css_class(cls)
-
-        if not metric.available:
-            self._bar.set_fraction(0.0)
-            self._pct_label.set_label("n/a")
-            self._reset_label.set_label("no usage")
-            self.set_opacity(0.5)
-            return
-
-        self.set_opacity(1.0)
         pct = max(0.0, min(100.0, metric.utilization))
         self._bar.set_fraction(pct / 100.0)
         self._pct_label.set_label(f"{pct:.0f}%")
@@ -169,7 +161,12 @@ class CumWidget(Adw.ApplicationWindow):
             self.error_banner.set_revealed(False)
             for metric in result.metrics:
                 row = self._rows.get(metric.name)
-                if row is not None:
+                if row is None:
+                    continue
+                # Metrics the API reports as null (e.g. per-model weekly caps
+                # that don't apply to the current plan) are hidden entirely.
+                row.set_visible(metric.available)
+                if metric.available:
                     row.update(metric)
             self.updated_label.set_label("updated: " + time.strftime("%H:%M:%S"))
         return GLib.SOURCE_REMOVE  # idle_add: run once

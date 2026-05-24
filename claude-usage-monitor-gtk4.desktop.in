@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Usage Monitor
+Comment=Monitor Claude Code usage limits
+Exec=@BIN@
+Icon=@ICON@
+Terminal=false
+Categories=Utility;System;Monitor;GTK;
+StartupWMClass=@APPID@

@@ -1,0 +1,52 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $CumWidget: Adw.ApplicationWindow {
+  title: "Claude Usage";
+  default-width: 300;
+  default-height: 240;
+  resizable: false;
+
+  content: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {
+      show-end-title-buttons: true;
+
+      title-widget: Adw.WindowTitle {
+        title: "Claude Usage";
+      };
+
+      [end]
+      Button refresh_button {
+        icon-name: "view-refresh-symbolic";
+        tooltip-text: "Refresh now";
+      }
+    }
+
+    [top]
+    Adw.Banner error_banner {
+      revealed: false;
+    }
+
+    content: Box {
+      orientation: vertical;
+      spacing: 10;
+      margin-top: 12;
+      margin-bottom: 12;
+      margin-start: 12;
+      margin-end: 12;
+
+      Box rows_box {
+        orientation: vertical;
+        spacing: 10;
+      }
+
+      Label updated_label {
+        halign: end;
+        margin-top: 4;
+        styles ["dim-label", "caption"]
+        label: "updated: --:--:--";
+      }
+    };
+  };
+}

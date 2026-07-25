@@ -101,6 +101,7 @@ class UsageRow(Gtk.Box):
         # Only called for available metrics; null ones are hidden by the caller.
         for cls in ("error", "warning"):
             self._bar.remove_css_class(cls)
+        self._bar.set_visible(True)
         pct = max(0.0, min(100.0, metric.utilization))
         self._bar.set_fraction(pct / 100.0)
         self._pct_label.set_label(f"{pct:.0f}%")
@@ -109,6 +110,28 @@ class UsageRow(Gtk.Box):
             self._bar.add_css_class("error")
         elif pct >= 70:
             self._bar.add_css_class("warning")
+
+    def update_extra(self, extra: api.ExtraUsage) -> None:
+        """Render paid extra-usage: a bar+amount when capped, amount only when not."""
+        for cls in ("error", "warning"):
+            self._bar.remove_css_class(cls)
+        pct = extra.utilization
+        if pct is not None:
+            # Capped: percentage bar, with "$spent / $limit" as the subtitle.
+            self._bar.set_visible(True)
+            pct = max(0.0, min(100.0, pct))
+            self._bar.set_fraction(pct / 100.0)
+            self._pct_label.set_label(f"{pct:.0f}%")
+            self._reset_label.set_label(f"{extra.spent_text} / {extra.limit_text}")
+            if pct >= 90:
+                self._bar.add_css_class("error")
+            elif pct >= 70:
+                self._bar.add_css_class("warning")
+        else:
+            # Uncapped pay-as-you-go: no bar (a bar would imply a limit).
+            self._bar.set_visible(False)
+            self._pct_label.set_label("")
+            self._reset_label.set_label(f"{extra.spent_text} spent")
 
 
 @Gtk.Template(string=_UI_STRING)
@@ -127,6 +150,11 @@ class CumWidget(Adw.ApplicationWindow):
             row = UsageRow(name)
             self._rows[name] = row
             self.rows_box.append(row)
+
+        # Extra (paid pay-as-you-go) usage row: shown only when enabled.
+        self._extra_row = UsageRow("Extra Usage")
+        self._extra_row.set_visible(False)
+        self.rows_box.append(self._extra_row)
 
         self._fetching = False
         self.refresh_button.connect("clicked", lambda _btn: self.refresh())
@@ -168,6 +196,10 @@ class CumWidget(Adw.ApplicationWindow):
                 row.set_visible(metric.available)
                 if metric.available:
                     row.update(metric)
+            extra = result.extra
+            self._extra_row.set_visible(extra is not None)
+            if extra is not None:
+                self._extra_row.update_extra(extra)
             self.updated_label.set_label("updated: " + time.strftime("%H:%M:%S"))
         return GLib.SOURCE_REMOVE  # idle_add: run once
 

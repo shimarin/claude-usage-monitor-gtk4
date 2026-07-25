@@ -42,6 +42,31 @@ METRIC_SOURCES: dict[str, str] = {
     "Opus": "seven_day_opus",
 }
 
+# Known ISO 4217 -> display symbol for extra-usage amounts. Unknown codes fall
+# back to the code itself (e.g. "AUD 1.23").
+_CURRENCY_SYMBOLS: dict[str, str] = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+}
+
+
+def format_credits(
+    minor_units: float,
+    currency: str | None = None,
+    decimal_places: int | None = None,
+) -> str:
+    """Format a minor-unit money amount (e.g. 658 -> "$6.58")."""
+    places = decimal_places if isinstance(decimal_places, int) and decimal_places >= 0 else 2
+    amount = minor_units / (10 ** places)
+    text = f"{amount:,.{places}f}"
+    if not currency:
+        return text
+    symbol = _CURRENCY_SYMBOLS.get(currency.upper(), currency.upper())
+    # Single-char symbols prefix the amount ("$6.58"); ISO codes suffix it.
+    return f"{symbol}{text}" if len(symbol) == 1 else f"{text} {symbol}"
+
 
 @dataclass(frozen=True)
 class Metric:
@@ -57,10 +82,47 @@ class Metric:
 
 
 @dataclass(frozen=True)
+class ExtraUsage:
+    """Paid extra-usage (pay-as-you-go) state, when enabled on the account.
+
+    ``used_credits``/``monthly_limit`` are amounts in the currency's minor units
+    (e.g. cents). ``monthly_limit`` is ``None`` for uncapped pay-as-you-go, where
+    there is no percentage to show — only the amount spent.
+    """
+
+    used_credits: float
+    monthly_limit: float | None
+    currency: str | None
+    decimal_places: int | None
+
+    @property
+    def has_limit(self) -> bool:
+        return self.monthly_limit is not None and self.monthly_limit > 0
+
+    @property
+    def utilization(self) -> float | None:
+        """Percentage 0..100, or ``None`` when uncapped (no limit to divide by)."""
+        if not self.has_limit:
+            return None
+        return self.used_credits / self.monthly_limit * 100.0
+
+    @property
+    def spent_text(self) -> str:
+        return format_credits(self.used_credits, self.currency, self.decimal_places)
+
+    @property
+    def limit_text(self) -> str | None:
+        if not self.has_limit:
+            return None
+        return format_credits(self.monthly_limit, self.currency, self.decimal_places)
+
+
+@dataclass(frozen=True)
 class UsageResult:
     """Outcome of a usage poll: either ``metrics`` populated, or ``error`` set."""
 
     metrics: list[Metric]
+    extra: ExtraUsage | None = None
     error: str | None = None
     auth_error: bool = False
     rate_limited: bool = False
@@ -148,6 +210,84 @@ def _parse_metrics(payload: dict[str, Any]) -> list[Metric]:
     return metrics
 
 
+def _parse_extra_usage(payload: dict[str, Any]) -> ExtraUsage | None:
+    extra = payload.get("extra_usage")
+    if not isinstance(extra, dict) or not extra.get("is_enabled"):
+        return None
+    used = extra.get("used_credits")
+    if not isinstance(used, (int, float)):
+        return None
+    limit = extra.get("monthly_limit")
+    places = extra.get("decimal_places")
+    currency = extra.get("currency")
+    return ExtraUsage(
+        used_credits=float(used),
+        monthly_limit=float(limit) if isinstance(limit, (int, float)) else None,
+        currency=currency if isinstance(currency, str) else None,
+        decimal_places=places if isinstance(places, int) else None,
+    )
+
+
+def _model_slug(display_name: str) -> str:
+    """Convert a model display name into a field-name suffix ("Opus" -> "opus")."""
+    cleaned = "".join(c if c.isalnum() else " " for c in display_name.lower())
+    return "_".join(cleaned.split())
+
+
+def _merge_scoped_limits(payload: dict[str, Any]) -> dict[str, Any]:
+    """Surface model-scoped weekly limits from the ``limits`` array as fields.
+
+    Newer usage responses carry per-model limits only inside the ``limits``
+    array (via ``scope.model``), no longer as top-level fields like
+    ``seven_day_sonnet``. Each active scoped limit is mapped onto a synthetic
+    quota field so the existing top-level field names keep working. The period
+    prefix is derived from the response — the non-scoped limit of the same
+    ``group`` shares its ``resets_at`` with an existing top-level quota field,
+    whose name supplies the prefix. An existing top-level field is never
+    overwritten (it carries higher-precision data). Ported from
+    jens-duttke/usage-monitor-for-claude.
+    """
+    limits = payload.get("limits")
+    if not isinstance(limits, list):
+        return payload
+
+    # resets_at -> existing top-level quota field name (the prefix source)
+    reset_to_field: dict[str, str] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict) and value.get("utilization") is not None:
+            resets_at = value.get("resets_at")
+            if resets_at:
+                reset_to_field.setdefault(resets_at, key)
+
+    # group -> period prefix, via the non-scoped limit's shared reset time
+    group_prefix: dict[str, str] = {}
+    for limit in limits:
+        if not isinstance(limit, dict) or limit.get("scope"):
+            continue
+        group = limit.get("group")
+        resets_at = limit.get("resets_at")
+        if group and resets_at and resets_at in reset_to_field:
+            group_prefix.setdefault(group, reset_to_field[resets_at])
+
+    merged = dict(payload)
+    for limit in limits:
+        if not isinstance(limit, dict):
+            continue
+        model = (limit.get("scope") or {}).get("model") or {}
+        display_name = model.get("display_name")
+        prefix = group_prefix.get(limit.get("group"))
+        if not display_name or not prefix:
+            continue
+        field = f"{prefix}_{_model_slug(display_name)}"
+        if merged.get(field) is not None:
+            continue
+        merged[field] = {
+            "utilization": float(limit.get("percent") or 0),
+            "resets_at": limit.get("resets_at"),
+        }
+    return merged
+
+
 def _server_message(resp: requests.Response | None) -> str | None:
     if resp is None:
         return None
@@ -211,7 +351,11 @@ def fetch_usage() -> UsageResult:
     except ValueError:
         return UsageResult(metrics=[], error="Invalid response from server")
 
-    return UsageResult(metrics=_parse_metrics(payload))
+    payload = _merge_scoped_limits(payload)
+    return UsageResult(
+        metrics=_parse_metrics(payload),
+        extra=_parse_extra_usage(payload),
+    )
 
 
 if __name__ == "__main__":
@@ -226,3 +370,9 @@ if __name__ == "__main__":
                 print(f"{m.name:8} {m.utilization:5.1f}%  resets {resets}")
             else:
                 print(f"{m.name:8}   n/a")
+        extra = result.extra
+        if extra is not None:
+            if extra.has_limit:
+                print(f"{'Extra':8} {extra.utilization:5.1f}%  {extra.spent_text} / {extra.limit_text}")
+            else:
+                print(f"{'Extra':8}   {extra.spent_text} spent (uncapped)")

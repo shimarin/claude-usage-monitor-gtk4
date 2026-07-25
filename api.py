@@ -134,14 +134,23 @@ class UsageResult:
 
 
 def read_access_token() -> str | None:
-    """Read the current OAuth access token, or None if unavailable."""
-    if not CLAUDE_CREDENTIALS.exists():
-        return None
+    """Read the current OAuth access token, or None if unavailable.
+
+    Returns None when the file is missing, temporarily unreadable (e.g. locked
+    while Claude Code rewrites it on token rotation), or not shaped as expected —
+    the caller treats all of these as "no token right now". No .exists() precheck:
+    it would race the rewrite; a missing file just surfaces as OSError here.
+    """
     try:
-        creds = json.loads(CLAUDE_CREDENTIALS.read_text())
-    except (OSError, json.JSONDecodeError):
+        creds = json.loads(CLAUDE_CREDENTIALS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
-    return creds.get("claudeAiOauth", {}).get("accessToken") or None
+    if not isinstance(creds, dict):
+        return None
+    oauth = creds.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    return oauth.get("accessToken") or None
 
 
 def _cli_version() -> str | None:

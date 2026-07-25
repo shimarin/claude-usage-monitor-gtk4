@@ -175,7 +175,13 @@ class CumWidget(Adw.ApplicationWindow):
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
     def _fetch_worker(self) -> None:
-        result = api.fetch_usage()
+        # fetch_usage() is designed never to raise, but guard anyway: an
+        # unexpected exception here must not leave _fetching stuck True (which
+        # would freeze polling permanently), so always deliver a result.
+        try:
+            result = api.fetch_usage()
+        except Exception as exc:  # noqa: BLE001 - last-resort safety net
+            result = api.UsageResult(metrics=[], error=f"Unexpected error: {exc}")
         GLib.idle_add(self._apply_result, result)
 
     def _apply_result(self, result: api.UsageResult) -> bool:

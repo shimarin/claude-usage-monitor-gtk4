@@ -48,8 +48,11 @@ def _load_ui_string() -> str:
 
 _UI_STRING = _load_ui_string()
 
-# Polling interval in seconds (settings-configurable later).
+# Polling cadence (settings-configurable later). A 429 backoff is honored up to
+# POLL_MAX_BACKOFF_S; a plain error retries sooner.
 POLL_INTERVAL_S = 60
+POLL_ERROR_S = 30
+POLL_MAX_BACKOFF_S = 900
 
 
 def _format_reset(resets_at: datetime | None) -> str:
@@ -90,6 +93,7 @@ class UsageRow(Gtk.Box):
         self._bar.set_fraction(0.0)
 
         self._reset_label = Gtk.Label(label="", xalign=0.0)
+        self._reset_label.set_wrap(True)
         self._reset_label.add_css_class("dim-label")
         self._reset_label.add_css_class("caption")
 
@@ -97,24 +101,31 @@ class UsageRow(Gtk.Box):
         self.append(self._bar)
         self.append(self._reset_label)
 
-    def update(self, metric: api.Metric) -> None:
-        # Only called for available metrics; null ones are hidden by the caller.
+    def _set_state_class(self, pct: float) -> None:
         for cls in ("error", "warning"):
             self._bar.remove_css_class(cls)
-        self._bar.set_visible(True)
-        pct = max(0.0, min(100.0, metric.utilization))
-        self._bar.set_fraction(pct / 100.0)
-        self._pct_label.set_label(f"{pct:.0f}%")
-        self._reset_label.set_label(_format_reset(metric.resets_at))
         if pct >= 90:
             self._bar.add_css_class("error")
         elif pct >= 70:
             self._bar.add_css_class("warning")
 
-    def update_extra(self, extra: api.ExtraUsage) -> None:
-        """Render paid extra-usage: a bar+amount when capped, amount only when not."""
-        for cls in ("error", "warning"):
-            self._bar.remove_css_class(cls)
+    def update(self, metric: api.Metric) -> None:
+        # Only called for available metrics; ones that do not apply to the
+        # account are not listed by the API client at all.
+        self._bar.set_visible(True)
+        pct = max(0.0, min(100.0, metric.utilization))
+        self._bar.set_fraction(pct / 100.0)
+        self._pct_label.set_label(f"{pct:.0f}%")
+        self._reset_label.set_label(_format_reset(metric.resets_at))
+        self._set_state_class(pct)
+
+    def update_extra(self, extra: api.ExtraUsage, prepaid: api.PrepaidBalance | None) -> None:
+        """Render paid extra-usage: a bar+amount when capped, amount only when not.
+
+        The prepaid credit balance is appended when the account has one, so it is
+        visible whether work can still continue or only what has been spent.
+        """
+        balance = f" · {prepaid.text} available" if prepaid is not None else ""
         pct = extra.utilization
         if pct is not None:
             # Capped: percentage bar, with "$spent / $limit" as the subtitle.
@@ -122,22 +133,20 @@ class UsageRow(Gtk.Box):
             pct = max(0.0, min(100.0, pct))
             self._bar.set_fraction(pct / 100.0)
             self._pct_label.set_label(f"{pct:.0f}%")
-            self._reset_label.set_label(f"{extra.spent_text} / {extra.limit_text}")
-            if pct >= 90:
-                self._bar.add_css_class("error")
-            elif pct >= 70:
-                self._bar.add_css_class("warning")
+            self._reset_label.set_label(f"{extra.spent_text} / {extra.limit_text}{balance}")
+            self._set_state_class(pct)
         else:
             # Uncapped pay-as-you-go: no bar (a bar would imply a limit).
             self._bar.set_visible(False)
             self._pct_label.set_label("")
-            self._reset_label.set_label(f"{extra.spent_text} spent")
+            self._reset_label.set_label(f"{extra.spent_text} spent{balance}")
 
 
 @Gtk.Template(string=_UI_STRING)
 class CumWidget(Adw.ApplicationWindow):
     __gtype_name__ = "CumWidget"
 
+    window_title = Gtk.Template.Child()
     rows_box = Gtk.Template.Child()
     updated_label = Gtk.Template.Child()
     refresh_button = Gtk.Template.Child()
@@ -145,11 +154,10 @@ class CumWidget(Adw.ApplicationWindow):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # Rows are created from the response, keyed by the API field name, so a
+        # quota type Anthropic adds or scopes to a single model shows up without
+        # a code change.
         self._rows: dict[str, UsageRow] = {}
-        for name in api.METRIC_SOURCES:
-            row = UsageRow(name)
-            self._rows[name] = row
-            self.rows_box.append(row)
 
         # Extra (paid pay-as-you-go) usage row: shown only when enabled.
         self._extra_row = UsageRow("Extra Usage")
@@ -157,14 +165,22 @@ class CumWidget(Adw.ApplicationWindow):
         self.rows_box.append(self._extra_row)
 
         self._fetching = False
+        self._timeout_id: int | None = None
         self.refresh_button.connect("clicked", lambda _btn: self.refresh())
 
         self.refresh()
-        self._timeout_id = GLib.timeout_add_seconds(POLL_INTERVAL_S, self._on_tick)
+        # Safety net: _apply_result re-arms this after every completed fetch.
+        self._schedule_next(POLL_INTERVAL_S)
+
+    def _schedule_next(self, delay: int) -> None:
+        if self._timeout_id is not None:
+            GLib.source_remove(self._timeout_id)
+        self._timeout_id = GLib.timeout_add_seconds(max(1, delay), self._on_tick)
 
     def _on_tick(self) -> bool:
+        self._timeout_id = None
         self.refresh()
-        return GLib.SOURCE_CONTINUE
+        return GLib.SOURCE_REMOVE  # re-armed from _apply_result
 
     def refresh(self) -> None:
         """Kick off a usage fetch on a worker thread (no-op if one is in flight)."""
@@ -184,30 +200,60 @@ class CumWidget(Adw.ApplicationWindow):
             result = api.UsageResult(metrics=[], error=f"Unexpected error: {exc}")
         GLib.idle_add(self._apply_result, result)
 
+    def _next_delay(self, result: api.UsageResult) -> int:
+        """Seconds until the next poll, honoring a 429 Retry-After."""
+        if not result.ok:
+            if result.rate_limited and result.retry_after:
+                return min(result.retry_after, POLL_MAX_BACKOFF_S)
+            return POLL_ERROR_S
+        return POLL_INTERVAL_S
+
     def _apply_result(self, result: api.UsageResult) -> bool:
         self._fetching = False
         self.refresh_button.set_sensitive(True)
+        self._schedule_next(self._next_delay(result))
 
         if not result.ok:
             self.error_banner.set_title(result.error or "Unknown error")
             self.error_banner.set_revealed(True)
-        else:
-            self.error_banner.set_revealed(False)
-            for metric in result.metrics:
-                row = self._rows.get(metric.name)
-                if row is None:
-                    continue
-                # Metrics the API reports as null (e.g. per-model weekly caps
-                # that don't apply to the current plan) are hidden entirely.
-                row.set_visible(metric.available)
-                if metric.available:
-                    row.update(metric)
-            extra = result.extra
-            self._extra_row.set_visible(extra is not None)
-            if extra is not None:
-                self._extra_row.update_extra(extra)
-            self.updated_label.set_label("updated: " + time.strftime("%H:%M:%S"))
+            return GLib.SOURCE_REMOVE  # idle_add: run once
+
+        self.error_banner.set_revealed(False)
+
+        rows: list[Gtk.Widget] = []
+        for metric in result.metrics:
+            row = self._rows.get(metric.field)
+            if row is None:
+                row = UsageRow(metric.name)
+                self._rows[metric.field] = row
+            row.update(metric)
+            rows.append(row)
+
+        extra = result.extra
+        self._extra_row.set_visible(extra is not None)
+        if extra is not None:
+            self._extra_row.update_extra(extra, result.prepaid)
+        rows.append(self._extra_row)
+
+        self._sync_order(rows)
+        if result.plan:
+            self.window_title.set_subtitle(result.plan)
+        self.updated_label.set_label("updated: " + time.strftime("%H:%M:%S"))
         return GLib.SOURCE_REMOVE  # idle_add: run once
+
+    def _sync_order(self, wanted: list[Gtk.Widget]) -> None:
+        """Put the rows in the API-derived order without rebuilding them every poll."""
+        current: list[Gtk.Widget] = []
+        child = self.rows_box.get_first_child()
+        while child is not None:
+            current.append(child)
+            child = child.get_next_sibling()
+        if current == wanted:
+            return
+        for widget in current:
+            self.rows_box.remove(widget)
+        for widget in wanted:
+            self.rows_box.append(widget)
 
 
 class CumApp(Adw.Application):

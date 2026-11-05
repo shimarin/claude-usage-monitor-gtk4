@@ -33,7 +33,7 @@ EXE   := $(BUILD)/$(BIN_NAME)
 UI    := $(BUILD)/widget.ui
 ICON  := $(BIN_NAME).png
 
-.PHONY: all build install uninstall clean run
+.PHONY: all build install uninstall clean test run
 
 all: $(EXE)
 
@@ -55,6 +55,9 @@ $(EXE): prototype.py api.py $(UI)
 
 run: $(EXE)
 	./$(EXE)
+
+test:
+	python3 -m unittest tests -v
 
 install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(APPSDIR) $(DESTDIR)$(ICONDIR)
